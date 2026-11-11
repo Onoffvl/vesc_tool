@@ -1,0 +1,129 @@
+name: Build VESC Tool for iOS
+
+# Save as .github/workflows/build-vesc-ios.yml on your repository's default branch.
+# Run it from the Actions tab. The artifact is an unsigned IPA for personal use.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  iphone:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+
+    steps:
+      - name: Check out VESC Tool 7.00
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: vedderb/vesc_tool
+          ref: 6528c4e2a963e86ae4104737ddf7c76ffc987d84
+          path: source
+          persist-credentials: false
+
+      - name: Install Qt 5.15.2 for iOS
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
+        with:
+          host: mac
+          target: ios
+          arch: ios
+          version: '5.15.2'
+
+      - name: Generate the iOS Xcode project
+        working-directory: source
+        shell: bash
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+          # Keep the personal build separate from the App Store app.
+          plutil -replace CFBundleIdentifier -string '$(PRODUCT_BUNDLE_IDENTIFIER)' ios/Info.plist
+          plutil -replace CFBundleDisplayName -string 'Motor Tool (Personal Build)' ios/Info.plist
+          plutil -replace CFBundleShortVersionString -string '7.0.0' ios/Info.plist
+          plutil -replace CFBundleVersion -string '7.0.0' ios/Info.plist
+
+          # Qt 5.15.2 headers rely on a transitive <limits> include in older C++ SDKs.
+          "$QT_ROOT_DIR/bin/qmake" -spec macx-ios-clang -config release \
+            'CONFIG+=iphoneos device' 'QMAKE_CXXFLAGS+=-include limits' \
+            QMAKE_TARGET_BUNDLE_PREFIX=org.selfbuild QMAKE_BUNDLE=motor-tool vesc_tool.pro
+
+          test -f 'VESC Tool.xcodeproj/project.pbxproj'
+
+      - name: Generate the Qt resource sources before Xcode builds
+        working-directory: source
+        shell: bash
+        run: |
+          qt_host_bins=$("$QT_ROOT_DIR/bin/qmake" -query QT_HOST_BINS)
+          rcc="$qt_host_bins/rcc"
+
+          # Xcode expects these generated sources in the project directory.
+          for resource in res_qml res_neutral; do
+            output="qrc_${resource}.cpp"
+            "$rcc" -name "$resource" -o "$output" "$resource.qrc"
+            test -s "$output"
+            printf 'Generated %s\n' "$output"
+          done
+
+      - name: Compile the arm64 iPhone app
+        id: compile
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/vesc-ios-build.log"
+          build_status=0
+          xcodebuild -project 'VESC Tool.xcodeproj' -target 'VESC Tool' \
+            -configuration Release -sdk iphoneos \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            ENABLE_BITCODE=NO ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/vesc-ios-products" build \
+            2>&1 | tee "$log" || build_status=$?
+
+          if (( build_status != 0 )); then
+            {
+              printf '### Xcode build failed (exit %s)\n\n' "$build_status"
+              printf 'See the `vesc-ios-build-log` artifact for the full build output.\n\n'
+              printf '```text\n'
+              grep -n -i -E -m 8 '(^|[[:space:]])(fatal )?error:|killed: [0-9]+|terminated due to signal|^make(\[[0-9]+\])?: \*\*\*' "$log" \
+                || tail -n 25 "$log"
+              printf '```\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$build_status"
+          fi
+
+      - name: Upload the Xcode failure log
+        if: ${{ failure() && steps.compile.outcome == 'failure' }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: vesc-ios-build-log
+          path: ${{ runner.temp }}/vesc-ios-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Package the unsigned IPA
+        shell: bash
+        run: |
+          app="$RUNNER_TEMP/vesc-ios-products/VESC Tool.app"
+          plist="$app/Info.plist"
+          executable=$(plutil -extract CFBundleExecutable raw -o - "$plist")
+          test "$(plutil -extract CFBundleSupportedPlatforms.0 raw -o - "$plist")" = iPhoneOS
+          xcrun lipo -verify_arch arm64 "$app/$executable"
+
+          staging=$(mktemp -d "$RUNNER_TEMP/vesc-ipa.XXXXXX")
+          mkdir -p "$staging/Payload" artifacts
+          ditto "$app" "$staging/Payload/VESC Tool.app"
+          ditto -c -k --keepParent "$staging/Payload" artifacts/VESC_Tool_7.00_unsigned.ipa
+          unzip -tq artifacts/VESC_Tool_7.00_unsigned.ipa
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: VESC-Tool-7.00-iOS-unsigned
+          path: artifacts/VESC_Tool_7.00_unsigned.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
